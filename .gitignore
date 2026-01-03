@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.env
+.venv
+venv/
+
+# Data
+data/logs.jsonl
+models/
+
+# OS
+.DS_Store
