@@ -18,6 +18,19 @@ def count_urls(text: str) -> int:
 def has_invite(text: str) -> bool:
     return bool(INVITE_REGEX.search(text))
 
+# Similarity Helpers
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def jaccard_similarity(a: str, b: str) -> float:
+    A, B = set(a.split()), set(b.split())
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
 # Setup
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -28,7 +41,7 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.message_counts = {}  # in-memory, per-process
-
+bot.recent_messages = {}
 
 # Events
 @bot.event
@@ -48,54 +61,103 @@ async def on_message(message: discord.Message):
     bot.message_counts[member.id] += 1
 
     message_count = bot.message_counts[member.id]
+    
+    # Normalize message
+    normalized_text = normalize(message.content)
 
-    # Only monitor first 3 messages
-    if message_count > 3:
-        return
+    # Init recent message buffer
+    bot.recent_messages.setdefault(member.id, [])
+    history = bot.recent_messages[member.id]
 
+    # Keep only last 5 minutes
+    history = [
+        m for m in history
+        if (now - m["timestamp"]).total_seconds() < 300
+    ]
+    
+    # Detect multi-channel repeats
+    repeated_across_channels = False
+    similarity_score = 0.0
+
+    for prev in history:
+        if prev["channel_id"] != message.channel.id:
+            sim = jaccard_similarity(prev["text"], normalized_text)
+            if sim >= 0.85:
+                repeated_across_channels = True
+                similarity_score = sim
+                break
 
     # Feature extraction
-    join_age_minutes = (
-        (now - member.joined_at).total_seconds() / 60
-        if member.joined_at
-        else None
+    num_urls = count_urls(message.content)
+    is_first = message_count == 1
+    is_new_join = (
+        member.joined_at
+        and (now - member.joined_at).total_seconds() < 600
     )
 
-    num_urls = count_urls(message.content)
+    # Spam scoring
+    spam_score = 0
+    triggers = []
 
+    if is_first:
+        spam_score += 2
+        triggers.append("first_message")
+
+    if num_urls > 0:
+        spam_score += 3
+        triggers.append("url")
+
+    if has_invite(message.content):
+        spam_score += 3
+        triggers.append("invite")
+
+    if repeated_across_channels:
+        spam_score += 5
+        triggers.append("multi_channel_repeat")
+
+
+    # Take action
+    action = "logged_only"
+
+    if spam_score >= 6:
+        await message.delete()
+        action = "deleted_spam"
+
+    # Log event
     log_entry = {
         "timestamp": now.isoformat(),
         "user_id": member.id,
         "username": str(member),
         "account_age_days": (now - member.created_at).days,
-        "join_age_minutes": join_age_minutes,
+        "join_age_minutes": (
+            (now - member.joined_at).total_seconds() / 60
+            if member.joined_at else None
+        ),
         "message_count": message_count,
         "message_length": len(message.content),
         "num_urls": num_urls,
+        "spam_score": spam_score,
+        "triggers": triggers,
+        "similarity_score": similarity_score,
+        "channel_id": message.channel.id,
+        "action": action,
         "message_text": message.content,
-        "action": "logged_only",
     }
 
-   
-    # Spam rule
-    is_first = message_count == 1
-    is_new_join = join_age_minutes is not None and join_age_minutes < 10
-    has_link = num_urls > 0 or has_invite(message.content)
-
-    if is_first and is_new_join and has_link:
-        try:
-            await message.delete()
-            log_entry["action"] = "deleted_first_message_link_new_join"
-        except discord.Forbidden:
-            log_entry["action"] = "delete_failed_missing_permissions"
-
-
-    # Logging
     with open("data/logs.jsonl", "a") as f:
         f.write(json.dumps(log_entry) + "\n")
 
-    await bot.process_commands(message)
+  
+    # Update history AFTER checks
+    history.append({
+        "channel_id": message.channel.id,
+        "timestamp": now,
+        "text": normalized_text
+    })
+    bot.recent_messages[member.id] = history
+    print(history)
 
+    await bot.process_commands(message)
 
 # Run
 bot.run(TOKEN)
