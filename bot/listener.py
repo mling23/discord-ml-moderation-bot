@@ -79,13 +79,15 @@ async def on_message(message: discord.Message):
     repeated_across_channels = False
     similarity_score = 0.0
 
+    matched_messages = []
+
     for prev in history:
         if prev["channel_id"] != message.channel.id:
             sim = jaccard_similarity(prev["text"], normalized_text)
             if sim >= 0.85:
                 repeated_across_channels = True
                 similarity_score = sim
-                break
+                matched_messages.append(prev)
 
     # Feature extraction
     num_urls = count_urls(message.content)
@@ -122,6 +124,19 @@ async def on_message(message: discord.Message):
     if spam_score >= 6:
         await message.delete()
         action = "deleted_spam"
+        # Retroactively delete previous matching messages
+        for prev in matched_messages:
+            try:
+                channel = message.guild.get_channel(prev["channel_id"])
+                if not channel:
+                    continue
+
+                old_msg = await channel.fetch_message(prev["message_id"])
+                await old_msg.delete()
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                pass
 
     # Log event
     log_entry = {
@@ -143,6 +158,10 @@ async def on_message(message: discord.Message):
         "action": action,
         "message_text": message.content,
     }
+    
+    log_entry["deleted_message_ids"] = [
+    prev["message_id"] for prev in matched_messages
+]
 
     with open("data/logs.jsonl", "a") as f:
         f.write(json.dumps(log_entry) + "\n")
@@ -150,6 +169,7 @@ async def on_message(message: discord.Message):
   
     # Update history AFTER checks
     history.append({
+        "message_id": message.id,
         "channel_id": message.channel.id,
         "timestamp": now,
         "text": normalized_text
