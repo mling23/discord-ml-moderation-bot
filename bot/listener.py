@@ -33,6 +33,8 @@ def jaccard_similarity(a: str, b: str) -> float:
 
 # Setup
 load_dotenv()
+SHADOW_MODE = os.getenv("SHADOW_MODE", "true").lower() == "true"
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 intents = discord.Intents.default()
@@ -50,10 +52,13 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
+    
     if message.author.bot or message.guild is None:
         return
 
     member = message.author
+    # if member.guild_permissions.manage_messages:
+    #     return
     now = datetime.now(timezone.utc)
 
     # Message count tracking
@@ -64,6 +69,8 @@ async def on_message(message: discord.Message):
     
     # Normalize message
     normalized_text = normalize(message.content)
+    if not normalized_text:
+        return
 
     # Init recent message buffer
     bot.recent_messages.setdefault(member.id, [])
@@ -121,22 +128,28 @@ async def on_message(message: discord.Message):
     # Take action
     action = "logged_only"
 
-    if spam_score >= 6:
-        await message.delete()
-        action = "deleted_spam"
-        # Retroactively delete previous matching messages
-        for prev in matched_messages:
-            try:
-                channel = message.guild.get_channel(prev["channel_id"])
-                if not channel:
-                    continue
+    action = "logged_only"
 
-                old_msg = await channel.fetch_message(prev["message_id"])
-                await old_msg.delete()
-            except discord.NotFound:
-                pass
-            except discord.Forbidden:
-                pass
+    ENFORCEMENT_THRESHOLD = 8  # higher threshold for safety
+
+    if spam_score >= ENFORCEMENT_THRESHOLD:
+        action = "spam_detected_shadow"
+
+        if not SHADOW_MODE:
+            await message.delete()
+            action = "deleted_spam"
+
+            # Retroactively delete previous matching messages
+            for prev in matched_messages:
+                try:
+                    channel = message.guild.get_channel(prev["channel_id"])
+                    if not channel:
+                        continue
+
+                    old_msg = await channel.fetch_message(prev["message_id"])
+                    await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
 
     # Log event
     log_entry = {
@@ -157,6 +170,7 @@ async def on_message(message: discord.Message):
         "channel_id": message.channel.id,
         "action": action,
         "message_text": message.content,
+        "log_shadow_mode": SHADOW_MODE,
     }
     
     log_entry["deleted_message_ids"] = [
