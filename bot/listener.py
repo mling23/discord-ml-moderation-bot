@@ -7,7 +7,17 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import logging
+import sys
 
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",  # raw JSON, no prefixes
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+logger = logging.getLogger("moderation-bot")
 # Regex helpers
 URL_REGEX = re.compile(r"https?://|www\.", re.IGNORECASE)
 INVITE_REGEX = re.compile(r"(discord\.gg/|discord\.com/invite/)", re.IGNORECASE)
@@ -177,8 +187,9 @@ async def on_message(message: discord.Message):
     prev["message_id"] for prev in matched_messages
 ]
 
-    with open("data/logs.jsonl", "a") as f:
-        f.write(json.dumps(log_entry) + "\n")
+    # with open("data/logs.jsonl", "a") as f:
+    #     f.write(json.dumps(log_entry) + "\n")
+    logger.info(json.dumps(log_entry))
 
   
     # Update history AFTER checks
@@ -189,7 +200,7 @@ async def on_message(message: discord.Message):
         "text": normalized_text
     })
     bot.recent_messages[member.id] = history
-    print(history)
+    #print(history)
 
     await bot.process_commands(message)
 
