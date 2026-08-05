@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package (without heavy ML deps)
+        # The unit tests only exercise pure logic (rules, scoring, spam index,
+        # fingerprint, burst tracker) plus the async SQLite layer. That needs
+        # numpy and aiosqlite, but not torch/sentence-transformers. Installing
+        # with --no-deps keeps CI fast by skipping the ~1GB ML stack.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . --no-deps
+          pip install numpy aiosqlite pytest pytest-asyncio ruff
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest

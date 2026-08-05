@@ -1,0 +1,12 @@
+services:
+  modbot:
+    build: .
+    # restart: unless-stopped is what turns "runs once" into 24/7 coverage.
+    # If the bot crashes or the VM reboots, Docker relaunches the container.
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Keep the SQLite database on a mounted volume so it survives rebuilds.
+      - DB_PATH=/app/data/moderation.db
+    volumes:
+      - ./data:/app/data
