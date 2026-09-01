@@ -35,17 +35,34 @@ The key challenge addressed is **data scarcity**: spam events are relatively rar
 
 ## 3. Design Philosophy
 
-This project intentionally uses a **hybrid system**:
 
-* **Rules** for high-precision detection of obvious spam (links, invites, mass mentions)
-* **Similarity detection** to leverage repeated templates (known-spam matches and self-repetition)
-* **Human-in-the-loop review** for medium-confidence cases, which also feeds new labels back into the system
+Message hashing uses normalization that strips zero-width/control characters and
+normalizes casing/whitespace to make copy-paste evasion harder.
 
 ML is used to *refine decisions*, not replace deterministic signals.
 
 ---
 
+defaults (shadow mode on, thresholds, similarity cutoffs, model name).
+Required: `DISCORD_TOKEN`, `TARGET_GUILD_ID`, `MOD_CHANNEL_ID`. Everything else
 ## 4. System Architecture
+
+Template learning uses two dedup guards:
+* exact-text hash dedup (`content_hash` unique in `spam_vectors`), and
+* near-duplicate cosine guard (`NEAR_DUPLICATE_SIMILARITY`, default `0.98`) to
+  avoid storing many almost-identical templates.
+
+### Admin Commands
+
+* `/status` - Show bot health/config summary, including trusted vs pending counts.
+* `/db_counts` - Show runtime row counts (trusted/pending users, vectors, logs).
+* `/db_spam_vectors limit:<1-25>` - List recent learned spam vectors with row id, time, and preview text.
+* `/db_spam_vector vector_id:<id>` - Inspect one learned vector's metadata and first values.
+* `/db_top_matched_templates limit:<1-25>` - Show which templates are most often matched by cosine similarity.
+* `/reset_database confirm:RESET` - Clear users, learned vectors, logs, and seed
+  flags. This intentionally requires the exact string `RESET` to reduce
+  accidental use. After reset, the bot reseeds trusted users from the target
+  guild on next ready/restart.
 
 ```
 Discord Gateway

@@ -13,6 +13,7 @@ so their messages are never scored or stored.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
 
 import discord
@@ -27,17 +28,40 @@ log = logging.getLogger(__name__)
 MIN_ML_LENGTH = 5
 
 
+@dataclass
+class KnownSpamMatch:
+    matched: bool
+    similarity: float = 0.0
+    vector_id: int | None = None
+    template_text: str = ""
+
+
+@dataclass
+class InsertResult:
+    added: bool
+    reason: str
+    matched_vector_id: int | None = None
+    similarity: float = 0.0
+
+
 class Moderation(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    def _is_target_guild(self, guild_id: int | None) -> bool:
+        return guild_id == self.bot.settings.target_guild_id
+
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
+        if not self._is_target_guild(member.guild.id):
+            return
         await self.bot.db.add_pending_user(member.id, member.joined_at)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.guild is None:
+            return
+        if not self._is_target_guild(message.guild.id):
             return
         # Commands are handled by the built-in processor; don't spam-score them.
         if message.content.startswith(self.bot.command_prefix):
@@ -63,13 +87,26 @@ class Moderation(commands.Cog):
                 return
             repeated = self.bot.burst_tracker.is_repeat(message.author.id, chash)
 
-        matched_known_spam = await self._known_spam_match(message)
+        known_match = await self._known_spam_match(message)
         result = score_message(
             message.content,
-            matched_known_spam=matched_known_spam,
+            matched_known_spam=known_match.matched,
             has_attachment=bool(message.attachments),
             repeated=repeated,
         )
+
+        if known_match.matched and known_match.vector_id is not None:
+            await self.bot.db.increment_spam_vector_hit(
+                known_match.vector_id,
+                known_match.similarity,
+                message.content,
+            )
+            log.info(
+                "Known-spam hit | vector_id=%s | similarity=%.4f | template_preview=%s",
+                known_match.vector_id,
+                known_match.similarity,
+                known_match.template_text[:120].replace("\n", " "),
+            )
 
         action = await self._apply_action(message, result)
 
@@ -84,14 +121,20 @@ class Moderation(commands.Cog):
                 message.author.id, message.content, chash, result.score, action
             )
 
-    async def _known_spam_match(self, message: discord.Message) -> bool:
+    async def _known_spam_match(self, message: discord.Message) -> KnownSpamMatch:
         """Fuzzy-match the message against the learned spam database."""
         content = message.content
         if self.bot.embedder is None or len(content) <= MIN_ML_LENGTH:
-            return False
+            return KnownSpamMatch(matched=False)
         vector = await self.bot.embedder.encode(content)
-        similarity = self.bot.spam_index.max_similarity(vector)
-        return similarity > self.bot.settings.known_spam_similarity
+        match = self.bot.spam_index.best_match(vector)
+        is_match = match.similarity > self.bot.settings.known_spam_similarity
+        return KnownSpamMatch(
+            matched=is_match,
+            similarity=match.similarity,
+            vector_id=match.vector_id,
+            template_text=match.template_text,
+        )
 
     async def _apply_action(
         self, message: discord.Message, result: ScoreResult
@@ -174,11 +217,53 @@ class Moderation(commands.Cog):
 
     async def _learn_signature(self, text: str, chash: str) -> None:
         """Auto-add a confirmed burst message to the known-spam database."""
+        result = await self.maybe_add_spam_template(text, chash=chash)
+        if not result.added:
+            log.info(
+                "Skipped template insert (%s) vector_id=%s similarity=%.4f",
+                result.reason,
+                result.matched_vector_id,
+                result.similarity,
+            )
+
+    async def maybe_add_spam_template(self, text: str, *, chash: str) -> InsertResult:
+        """Add a learned spam template unless it is near-duplicate to existing.
+
+        Returns an :class:`InsertResult` explaining whether insertion happened.
+        """
         if self.bot.embedder is None:
-            return
+            return InsertResult(added=False, reason="embedder_disabled")
+
         vector = await self.bot.embedder.encode(text)
-        if await self.bot.db.add_spam_vector(vector, text, chash):
-            self.bot.spam_index.add(vector)
+        if len(self.bot.spam_index) > 0:
+            best = self.bot.spam_index.best_match(vector)
+            if best.similarity >= self.bot.settings.near_duplicate_similarity:
+                return InsertResult(
+                    added=False,
+                    reason="near_duplicate",
+                    matched_vector_id=best.vector_id,
+                    similarity=best.similarity,
+                )
+
+        added = await self.bot.db.add_spam_vector(vector, text, chash)
+        if not added:
+            return InsertResult(added=False, reason="hash_duplicate")
+
+        records = await self.bot.db.load_vector_records()
+        if records:
+            newest = records[-1]
+            self.bot.spam_index.add(
+                vector,
+                vector_id=newest["id"],
+                template_text=newest["text"],
+            )
+            return InsertResult(
+                added=True,
+                reason="inserted",
+                matched_vector_id=newest["id"],
+            )
+
+        return InsertResult(added=True, reason="inserted")
 
     async def _send_for_review(
         self, message: discord.Message, result: ScoreResult

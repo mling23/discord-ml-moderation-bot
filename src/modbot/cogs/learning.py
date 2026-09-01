@@ -35,6 +35,12 @@ async def setup(bot) -> None:
     async def report_spam(
         interaction: discord.Interaction, message: discord.Message
     ) -> None:
+        if interaction.guild_id != bot.settings.target_guild_id:
+            await interaction.response.send_message(
+                "This moderation workflow is only enabled in the configured server.",
+                ephemeral=True,
+            )
+            return
         if not await _is_pending(bot, message.author.id):
             await interaction.response.send_message(
                 "\u274c This user is a trusted community member and cannot be "

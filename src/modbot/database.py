@@ -139,6 +139,242 @@ class DatabaseManager:
             )
             await db.commit()
 
+    async def get_user_status_counts(self) -> tuple[int, int]:
+        """Return ``(trusted_count, pending_count)`` from the users table."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT status, COUNT(*) FROM users GROUP BY status"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        counts = {status: count for status, count in rows}
+        return int(counts.get("trusted", 0)), int(counts.get("pending", 0))
+
+    async def get_runtime_counts(self) -> dict[str, int]:
+        """Return high-level row counts for admin diagnostics."""
+        trusted, pending = await self.get_user_status_counts()
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT COUNT(*) FROM spam_vectors") as cursor:
+                spam_vectors = int((await cursor.fetchone())[0])
+            async with db.execute("SELECT COUNT(*) FROM logs") as cursor:
+                logs = int((await cursor.fetchone())[0])
+        return {
+            "trusted": trusted,
+            "pending": pending,
+            "spam_vectors": spam_vectors,
+            "logs": logs,
+        }
+
+    # --- One-time seed flag ---
+    async def is_seeded(self) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT value FROM meta WHERE key = 'seeded'"
+            ) as cursor:
+                return await cursor.fetchone() is not None
+
+    async def mark_seeded(self) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('seeded', '1')"
+            )
+            await db.commit()
+
+    async def reset_data(self) -> dict[str, int]:
+        """Delete all runtime data and return a summary of removed rows.
+
+        This clears users, learned spam vectors, logs, and meta flags so the bot
+        can be reseeded cleanly.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+                users_count = int((await cursor.fetchone())[0])
+            async with db.execute("SELECT COUNT(*) FROM spam_vectors") as cursor:
+                vectors_count = int((await cursor.fetchone())[0])
+            async with db.execute("SELECT COUNT(*) FROM logs") as cursor:
+                logs_count = int((await cursor.fetchone())[0])
+
+            await db.execute("DELETE FROM users")
+            await db.execute("DELETE FROM spam_vectors")
+            await db.execute("DELETE FROM logs")
+            await db.execute("DELETE FROM meta")
+            await db.commit()
+
+        return {
+            "users": users_count,
+            "spam_vectors": vectors_count,
+            "logs": logs_count,
+        }
+
+    # --- Spam vectors (deduped by content hash) ---
+    async def add_spam_vector(
+        self, embedding: np.ndarray, text: str, content_hash: str
+    ) -> bool:
+        """Store a learned spam signature. Returns False if it was a duplicate."""
+        blob = _serialize_vector(embedding)
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO spam_vectors "
+                "(embedding, original_text, content_hash, added_at) VALUES (?, ?, ?, ?)",
+                (blob, text, content_hash, _now_iso()),
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def load_vectors(self) -> list[np.ndarray]:
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("SELECT embedding FROM spam_vectors") as cursor:
+                rows = await cursor.fetchall()
+        return [_deserialize_vector(row[0]) for row in rows]
+
+    async def load_vector_records(self) -> list[dict]:
+        """Load vectors with ids/text for in-memory nearest-match context."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id, embedding, original_text FROM spam_vectors ORDER BY id"
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            {
+                "id": int(row[0]),
+                "vector": _deserialize_vector(row[1]),
+                "text": row[2] or "",
+            }
+            for row in rows
+        ]
+
+    async def increment_spam_vector_hit(
+        self, vector_id: int, similarity: float, matched_text: str
+    ) -> None:
+        """Increment hit stats for a template and store a sample matched text."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spam_vector_hits (
+                    vector_id INTEGER PRIMARY KEY,
+                    hit_count INTEGER DEFAULT 0,
+                    last_similarity REAL,
+                    last_matched_text TEXT,
+                    last_hit_at TEXT
+                )
+                """
+            )
+            await db.execute(
+                "INSERT INTO spam_vector_hits "
+                "(vector_id, hit_count, last_similarity, last_matched_text, last_hit_at) "
+                "VALUES (?, 1, ?, ?, ?) "
+                "ON CONFLICT(vector_id) DO UPDATE SET "
+                "hit_count = hit_count + 1, "
+                "last_similarity = excluded.last_similarity, "
+                "last_matched_text = excluded.last_matched_text, "
+                "last_hit_at = excluded.last_hit_at",
+                (vector_id, similarity, matched_text[:1000], _now_iso()),
+            )
+            await db.commit()
+
+    async def top_spam_vector_hits(self, limit: int = 10) -> list[dict]:
+        """Return top templates by cosine-match hit count."""
+        safe_limit = max(1, min(limit, 25))
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS spam_vector_hits (
+                    vector_id INTEGER PRIMARY KEY,
+                    hit_count INTEGER DEFAULT 0,
+                    last_similarity REAL,
+                    last_matched_text TEXT,
+                    last_hit_at TEXT
+                )
+                """
+            )
+            async with db.execute(
+                "SELECT h.vector_id, h.hit_count, h.last_similarity, h.last_hit_at, "
+                "s.original_text "
+                "FROM spam_vector_hits h "
+                "LEFT JOIN spam_vectors s ON s.id = h.vector_id "
+                "ORDER BY h.hit_count DESC, h.last_hit_at DESC "
+                "LIMIT ?",
+                (safe_limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        out: list[dict] = []
+        for row in rows:
+            out.append(
+                {
+                    "vector_id": int(row[0]),
+                    "hit_count": int(row[1]),
+                    "last_similarity": float(row[2]) if row[2] is not None else 0.0,
+                    "last_hit_at": row[3] or "",
+                    "template_text": (row[4] or "")[:120],
+                }
+            )
+        return out
+
+    async def list_spam_vector_previews(self, limit: int = 5) -> list[dict]:
+        """Return lightweight previews for recent learned spam vectors."""
+        safe_limit = max(1, min(limit, 25))
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id, content_hash, original_text, added_at "
+                "FROM spam_vectors ORDER BY id DESC LIMIT ?",
+                (safe_limit,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+
+        previews: list[dict] = []
+        for row in rows:
+            text = (row[2] or "").replace("\n", " ").strip()
+            previews.append(
+                {
+                    "id": int(row[0]),
+                    "hash": row[1] or "",
+                    "text_preview": text[:80],
+                    "added_at": row[3] or "",
+                }
+            )
+        return previews
+
+    async def get_spam_vector_details(self, vector_id: int) -> dict | None:
+        """Return detailed metadata/stats for a specific spam vector row."""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute(
+                "SELECT id, embedding, content_hash, original_text, added_at "
+                "FROM spam_vectors WHERE id = ?",
+                (vector_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        vector = _deserialize_vector(row[1])
+        preview_values = ", ".join(f"{float(v):.4f}" for v in vector[:8])
+        return {
+            "id": int(row[0]),
+            "hash": row[2] or "",
+            "text": row[3] or "",
+            "added_at": row[4] or "",
+            "dimension": int(vector.shape[0]),
+            "norm": float(np.linalg.norm(vector)),
+            "values_preview": preview_values,
+        }
+
+    # --- Audit log ---
+    async def log_action(
+        self,
+        user_id: int,
+        content: str,
+        content_hash: str | None,
+        score: float,
+        action: str,
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO logs (user_id, content, content_hash, spam_score, action, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, content, content_hash, score, action, _now_iso()),
+            )
+            await db.commit()
+
     # --- One-time seed flag ---
     async def is_seeded(self) -> bool:
         async with aiosqlite.connect(self.db_path) as db:

@@ -39,7 +39,12 @@ class ModBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.db.init_db()
-        self.spam_index = SpamIndex(await self.db.load_vectors())
+        records = await self.db.load_vector_records()
+        self.spam_index = SpamIndex(
+            [r["vector"] for r in records],
+            vector_ids=[r["id"] for r in records],
+            template_texts=[r["text"] for r in records],
+        )
         log.info("Loaded %d spam signatures from DB.", len(self.spam_index))
 
         # The ML model is a core feature, but we degrade gracefully so the bot
@@ -60,24 +65,53 @@ class ModBot(commands.Bot):
         log.info("Synced %d application command(s).", len(synced))
 
     async def on_ready(self) -> None:
+        target_guild = self.get_guild(self.settings.target_guild_id)
+        mod_channel = self.get_channel(self.settings.mod_channel_id)
+        seeded = await self.db.is_seeded()
         log.info(
             "Logged in as %s (shadow_mode=%s)",
             self.user,
             self.settings.shadow_mode,
         )
+        log.info(
+            "Diagnostics | target_guild=%s | mod_channel=%s | seeded=%s | "
+            "burst_channels=%s | burst_window=%ss | review=%s delete=%s timeout=%s",
+            (
+                f"{target_guild.name}({target_guild.id})"
+                if target_guild is not None
+                else f"missing({self.settings.target_guild_id})"
+            ),
+            (
+                f"#{mod_channel.name}({mod_channel.id})"
+                if mod_channel is not None
+                else f"missing({self.settings.mod_channel_id})"
+            ),
+            seeded,
+            self.settings.burst_channels,
+            self.settings.burst_window_seconds,
+            self.settings.review_threshold,
+            self.settings.delete_threshold,
+            self.settings.timeout_threshold,
+        )
         # One-time: mark everyone already in the server as trusted, so only new
         # joiners are ever evaluated. Guarded by a flag so reconnects don't
         # re-trust members who joined (and are being monitored) after launch.
-        if not await self.db.is_seeded():
+        if not seeded:
             await self._seed_trusted_members()
             await self.db.mark_seeded()
 
     async def _seed_trusted_members(self) -> None:
-        member_ids = {
-            member.id
-            for guild in self.guilds
-            for member in guild.members
-            if not member.bot
-        }
+        guild = self.get_guild(self.settings.target_guild_id)
+        if guild is None:
+            log.warning(
+                "Target guild %s is not available; skipping seed.",
+                self.settings.target_guild_id,
+            )
+            return
+        member_ids = {member.id for member in guild.members if not member.bot}
         await self.db.trust_members(member_ids)
-        log.info("Seeded %d existing members as trusted.", len(member_ids))
+        log.info(
+            "Seeded %d existing members as trusted in guild %s.",
+            len(member_ids),
+            self.settings.target_guild_id,
+        )
