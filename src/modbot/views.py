@@ -35,21 +35,39 @@ class SpamReviewView(discord.ui.View):
             )
             return
 
-        vector = await self.bot.embedder.encode(self.text_content)
-        added = await self.bot.db.add_spam_vector(
-            vector, self.text_content, content_hash(self.text_content)
+        moderation_cog = self.bot.get_cog("Moderation")
+        if moderation_cog is None:
+            await interaction.response.send_message(
+                "Moderation system unavailable.", ephemeral=True
+            )
+            return
+
+        result = await moderation_cog.maybe_add_spam_template(
+            self.text_content,
+            chash=content_hash(self.text_content),
         )
-        if added:
-            self.bot.spam_index.add(vector)
 
         button.label = "Spam Confirmed"
         button.disabled = True
         self.ignore_spam.disabled = True
         await interaction.response.edit_message(view=self)
-        await interaction.followup.send(
-            f"\u2705 Learned new spam pattern. (Total: {len(self.bot.spam_index)})",
-            ephemeral=True,
-        )
+        if result.added:
+            message = (
+                f"\u2705 Learned new spam pattern. "
+                f"(Total: {len(self.bot.spam_index)})"
+            )
+        elif result.reason == "near_duplicate":
+            message = (
+                f"\u2139\ufe0f Near-duplicate of existing template "
+                f"#{result.matched_vector_id} (sim={result.similarity:.4f}); "
+                "skipped insert."
+            )
+        elif result.reason == "hash_duplicate":
+            message = "\u2139\ufe0f Exact duplicate template already exists; skipped insert."
+        else:
+            message = "\u2139\ufe0f Template insert skipped."
+
+        await interaction.followup.send(message, ephemeral=True)
 
     @discord.ui.button(
         label="Ignore / False Positive", style=discord.ButtonStyle.secondary

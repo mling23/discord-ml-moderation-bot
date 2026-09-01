@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     # --- Required ---
     discord_token: str
+    target_guild_id: int
     mod_channel_id: int
 
     # --- Behaviour ---
@@ -35,6 +36,9 @@ class Settings(BaseSettings):
 
     # --- Similarity threshold (fuzzy match against the learned spam DB) ---
     known_spam_similarity: float = 0.85
+    # Prevent adding redundant templates that are nearly identical to an
+    # existing one. If best known-template cosine >= this value, skip insert.
+    near_duplicate_similarity: float = 0.98
 
     # --- Burst / duplicate detection (exact-fingerprint, in memory) ---
     burst_channels: int = 3
